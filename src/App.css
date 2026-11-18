@@ -124,10 +124,36 @@ body {
   flex: 1;
 }
 
+.search-bar select {
+  max-width: 9.5rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  padding: 0.55em 0.7em;
+  font-size: 1em;
+  font-family: inherit;
+  color: var(--text);
+  background: #151a22;
+}
+
 .status {
   margin: 0;
   color: var(--muted);
   font-size: 0.85rem;
+}
+
+.status-error {
+  color: #f0a8a8;
+}
+
+.busy-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.now-error {
+  color: #f0a8a8;
+  font-size: 0.8rem;
 }
 
 .search-results {
