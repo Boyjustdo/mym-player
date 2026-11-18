@@ -1,4 +1,4 @@
-import { getApiBaseUrl } from "./config";
+import { resolveApiUrl } from "./url";
 import type {
   CreatePlaybackRequest,
   CreatePlaybackResponse,
@@ -7,89 +7,216 @@ import type {
   SearchItem,
 } from "./types";
 
-function apiUrl(path: string): string {
-  const base = getApiBaseUrl();
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return `${base}${p}`;
-}
-
 /**
  * Thin fetch helper. Do not forge browser headers (sec-ch-ua, Referer, etc.).
  * Do not forward Cookie / Authorization — API is anonymous.
  */
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(apiUrl(path), {
+async function requestJson<T>(
+  urlOrPath: string,
+  init?: RequestInit,
+): Promise<{ data: T; status: number }> {
+  const url = resolveApiUrl(urlOrPath);
+  const res = await fetch(url, {
     ...init,
     headers: {
       Accept: "application/json",
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
       ...(init?.headers ?? {}),
     },
   });
+
+  const text = await res.text().catch(() => "");
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+    let detail = text || res.statusText;
+    try {
+      const err = JSON.parse(text) as { detail?: string };
+      if (err.detail) detail = err.detail;
+    } catch {
+      // keep raw text
+    }
+    throw new Error(`HTTP ${res.status}: ${detail}`);
   }
-  return (await res.json()) as T;
+
+  if (!text) {
+    throw new Error(`HTTP ${res.status}: empty body`);
+  }
+  return { data: JSON.parse(text) as T, status: res.status };
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(() => resolve(), ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timer);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
 }
 
 /** GET /api/v1/platforms */
 export async function listPlatforms(): Promise<PlatformInfo[]> {
-  // TODO: wire response shape once UI needs platform picker
-  return requestJson<PlatformInfo[]>("/api/v1/platforms");
+  const { data } = await requestJson<PlatformInfo[]>("/api/v1/platforms");
+  return data;
 }
 
-/**
- * GET /api/v1/search?platform&q&limit
- * Skeleton: returns empty list until search is implemented against live API.
- */
+/** GET /api/v1/search?platform&q&limit — response is SearchItem[]. */
 export async function searchTracks(params: {
   q: string;
-  platform?: string;
+  platform: string;
   limit?: number;
 }): Promise<SearchItem[]> {
   const query = new URLSearchParams();
+  query.set("platform", params.platform);
   query.set("q", params.q);
-  if (params.platform) query.set("platform", params.platform);
-  if (params.limit != null) query.set("limit", String(params.limit));
+  query.set("limit", String(params.limit ?? 10));
 
-  // TODO: call live API and normalize SearchResponse → SearchItem[]
-  // const data = await requestJson<SearchResponse>(`/api/v1/search?${query}`);
-  // return data.results ?? data.items ?? [];
-  console.info("[api] searchTracks stub", { ...params, url: apiUrl(`/api/v1/search?${query}`) });
-  return [];
+  const { data } = await requestJson<SearchItem[]>(
+    `/api/v1/search?${query.toString()}`,
+  );
+  return Array.isArray(data) ? data : [];
 }
 
 /**
  * POST /api/v1/playbacks — omit streaming_mode for standard download path.
- * TODO: implement create + poll status_url until completed + download audio_url.
+ * Accepts 200 (already completed) or 202 (queued/processing/streaming).
  */
 export async function createPlayback(
   body: CreatePlaybackRequest,
 ): Promise<CreatePlaybackResponse> {
-  // TODO:
-  // 1. POST /api/v1/playbacks (omit streaming_mode)
-  // 2. If 202, poll status_url (~1s, backoff) until completed | failed
-  // 3. On completed, GET audio_url (keep rev query) and save to local cache
-  // 4. Do not use repeated POST instead of polling; do not treat streaming as done
-  void body;
-  throw new Error("createPlayback not implemented (skeleton stub)");
+  const payload: CreatePlaybackRequest = {
+    platform: body.platform,
+    query: body.query.trim(),
+    selected_id: body.selected_id || undefined,
+    quality: body.quality ?? "high",
+    include_cover: body.include_cover ?? true,
+  };
+
+  const { data } = await requestJson<CreatePlaybackResponse>(
+    "/api/v1/playbacks",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+  return data;
 }
 
-/** GET status_url / /api/v1/playbacks/{id} */
-export async function getPlaybackStatus(_statusUrl: string): Promise<PlaybackTask> {
-  // TODO: poll until completed | failed; stop on failed
-  throw new Error("getPlaybackStatus not implemented (skeleton stub)");
+/** GET status_url → PlaybackTask */
+export async function getPlaybackStatus(
+  statusUrl: string,
+): Promise<PlaybackTask> {
+  const { data } = await requestJson<PlaybackTask>(statusUrl);
+  return data;
+}
+
+function hasAudioUrl(task: PlaybackTask, createResponse?: CreatePlaybackResponse): boolean {
+  return Boolean(task.audio_url?.trim() || createResponse?.audio_url?.trim());
 }
 
 /**
- * Download completed audio to local cache.
- * Media host may be music.zr.wiki — follow the absolute URL from the API.
+ * Poll until the track is playable online: `streaming` or `completed` with audio_url.
+ * Still stops on `failed`. Does not treat streaming as "cache-ready".
  */
-export async function downloadAudioToCache(_args: {
-  audioUrl: string;
-  destPath: string;
-}): Promise<void> {
-  // TODO: GET audio_url with Range support; persist by Content-Type / disposition
-  // Do not hardcode .mp3 / .m4a extensions
-  throw new Error("downloadAudioToCache not implemented (skeleton stub)");
+export async function waitForPlaybackPlayable(
+  statusUrl: string,
+  options?: {
+    onUpdate?: (task: PlaybackTask) => void;
+    signal?: AbortSignal;
+    createResponse?: CreatePlaybackResponse;
+  },
+): Promise<PlaybackTask> {
+  let delayMs = 800;
+  const maxDelayMs = 4000;
+
+  while (true) {
+    if (options?.signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+
+    const task = await getPlaybackStatus(statusUrl);
+    options?.onUpdate?.(task);
+
+    if (task.status === "failed") {
+      throw new Error(task.error?.trim() || "播放任务失败");
+    }
+
+    if (
+      (task.status === "streaming" || task.status === "completed") &&
+      hasAudioUrl(task, options?.createResponse)
+    ) {
+      return task;
+    }
+
+    await sleep(delayMs, options?.signal);
+    delayMs = Math.min(Math.round(delayMs * 1.25), maxDelayMs);
+  }
+}
+
+/**
+ * Continue polling until completed or failed (for stable offline cache).
+ */
+export async function waitForPlaybackCompleted(
+  statusUrl: string,
+  options?: {
+    onUpdate?: (task: PlaybackTask) => void;
+    signal?: AbortSignal;
+  },
+): Promise<PlaybackTask> {
+  let delayMs = 1000;
+  const maxDelayMs = 5000;
+
+  while (true) {
+    if (options?.signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+
+    const task = await getPlaybackStatus(statusUrl);
+    options?.onUpdate?.(task);
+
+    if (task.status === "completed") {
+      return task;
+    }
+    if (task.status === "failed") {
+      throw new Error(task.error?.trim() || "播放任务失败");
+    }
+
+    await sleep(delayMs, options?.signal);
+    delayMs = Math.min(Math.round(delayMs * 1.25), maxDelayMs);
+  }
+}
+
+/**
+ * Prefer audio_url from the latest task (keep rev query params).
+ * Absolute media-host URLs are left unchanged.
+ */
+export function pickAudioUrl(
+  task: PlaybackTask,
+  createResponse?: CreatePlaybackResponse,
+): string {
+  const fromTask = task.audio_url?.trim();
+  if (fromTask) return resolveApiUrl(fromTask);
+  const fromCreate = createResponse?.audio_url?.trim();
+  if (fromCreate) return resolveApiUrl(fromCreate);
+  throw new Error("任务缺少 audio_url");
+}
+
+/** Cache file stem: quality-aware, prefer server playback id. */
+export function cacheFileStem(args: {
+  playbackId?: string | null;
+  platform: string;
+  trackId: string;
+  quality: string;
+}): string {
+  if (args.playbackId?.trim()) {
+    return args.playbackId.trim();
+  }
+  return `${args.platform}--${args.trackId}--${args.quality}`;
 }
