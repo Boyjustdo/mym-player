@@ -117,9 +117,51 @@ export async function getPlaybackStatus(
   return data;
 }
 
+function hasAudioUrl(task: PlaybackTask, createResponse?: CreatePlaybackResponse): boolean {
+  return Boolean(task.audio_url?.trim() || createResponse?.audio_url?.trim());
+}
+
 /**
- * Poll status_url until completed or failed.
- * Do not treat `streaming` as done. Stop and surface error on failed.
+ * Poll until the track is playable online: `streaming` or `completed` with audio_url.
+ * Still stops on `failed`. Does not treat streaming as "cache-ready".
+ */
+export async function waitForPlaybackPlayable(
+  statusUrl: string,
+  options?: {
+    onUpdate?: (task: PlaybackTask) => void;
+    signal?: AbortSignal;
+    createResponse?: CreatePlaybackResponse;
+  },
+): Promise<PlaybackTask> {
+  let delayMs = 800;
+  const maxDelayMs = 4000;
+
+  while (true) {
+    if (options?.signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+
+    const task = await getPlaybackStatus(statusUrl);
+    options?.onUpdate?.(task);
+
+    if (task.status === "failed") {
+      throw new Error(task.error?.trim() || "播放任务失败");
+    }
+
+    if (
+      (task.status === "streaming" || task.status === "completed") &&
+      hasAudioUrl(task, options?.createResponse)
+    ) {
+      return task;
+    }
+
+    await sleep(delayMs, options?.signal);
+    delayMs = Math.min(Math.round(delayMs * 1.25), maxDelayMs);
+  }
+}
+
+/**
+ * Continue polling until completed or failed (for stable offline cache).
  */
 export async function waitForPlaybackCompleted(
   statusUrl: string,
@@ -131,7 +173,6 @@ export async function waitForPlaybackCompleted(
   let delayMs = 1000;
   const maxDelayMs = 5000;
 
-  // First response may already be completed (HTTP 200 create path).
   while (true) {
     if (options?.signal?.aborted) {
       throw new DOMException("Aborted", "AbortError");
@@ -153,7 +194,8 @@ export async function waitForPlaybackCompleted(
 }
 
 /**
- * Prefer audio_url from the latest completed task (keep rev query params).
+ * Prefer audio_url from the latest task (keep rev query params).
+ * Absolute media-host URLs are left unchanged.
  */
 export function pickAudioUrl(
   task: PlaybackTask,
@@ -163,5 +205,18 @@ export function pickAudioUrl(
   if (fromTask) return resolveApiUrl(fromTask);
   const fromCreate = createResponse?.audio_url?.trim();
   if (fromCreate) return resolveApiUrl(fromCreate);
-  throw new Error("completed 任务缺少 audio_url");
+  throw new Error("任务缺少 audio_url");
+}
+
+/** Cache file stem: quality-aware, prefer server playback id. */
+export function cacheFileStem(args: {
+  playbackId?: string | null;
+  platform: string;
+  trackId: string;
+  quality: string;
+}): string {
+  if (args.playbackId?.trim()) {
+    return args.playbackId.trim();
+  }
+  return `${args.platform}--${args.trackId}--${args.quality}`;
 }

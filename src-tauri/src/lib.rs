@@ -1,5 +1,6 @@
+use futures_util::StreamExt;
 use serde::Serialize;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
@@ -21,6 +22,8 @@ struct DownloadAudioResult {
     path: String,
     reused: bool,
 }
+
+const AUDIO_EXTS: &[&str] = &["mp3", "m4a", "flac", "ogg", "wav", "webm", "bin"];
 
 fn app_data_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
@@ -74,6 +77,20 @@ fn sanitize_stem(stem: &str) -> String {
     }
 }
 
+fn find_cached_file(audio_dir: &Path, stem: &str) -> Option<PathBuf> {
+    for ext in AUDIO_EXTS {
+        let candidate = audio_dir.join(format!("{stem}.{ext}"));
+        if candidate.is_file() {
+            if let Ok(meta) = fs::metadata(&candidate) {
+                if meta.len() > 0 {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn ext_from_content_type(content_type: Option<&str>, format_hint: Option<&str>) -> String {
     if let Some(ct) = content_type {
         let mime = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
@@ -110,7 +127,6 @@ fn ext_from_content_type(content_type: Option<&str>, format_hint: Option<&str>) 
 
 fn ext_from_disposition(header: Option<&str>) -> Option<String> {
     let value = header?;
-    // filename="foo.mp3" or filename*=UTF-8''foo.mp3
     let lower = value.to_ascii_lowercase();
     let name = if let Some(idx) = lower.find("filename*=") {
         let rest = &value[idx + "filename*=".len()..];
@@ -141,6 +157,42 @@ fn ext_from_disposition(header: Option<&str>) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
+async fn write_response_to_file(
+    response: reqwest::Response,
+    dest: &Path,
+    tmp: &Path,
+    append_from: u64,
+) -> Result<(), String> {
+    let mut file = if append_from > 0 {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tmp)
+            .map_err(|e| format!("open temp append: {e}"))?
+    } else {
+        File::create(tmp).map_err(|e| format!("create temp: {e}"))?
+    };
+
+    let mut stream = response.bytes_stream();
+    let mut written = append_from;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("download chunk: {e}"))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("write temp: {e}"))?;
+        written += bytes.len() as u64;
+    }
+
+    if written == 0 {
+        let _ = fs::remove_file(tmp);
+        return Err("download returned empty body".into());
+    }
+
+    file.sync_all().map_err(|e| format!("sync temp: {e}"))?;
+    drop(file);
+    fs::rename(tmp, dest).map_err(|e| format!("finalize file: {e}"))?;
+    Ok(())
+}
+
 /// Return the application data directory path.
 #[tauri::command]
 fn get_app_data_dir(app: AppHandle) -> Result<String, String> {
@@ -163,7 +215,16 @@ fn open_cache_dir(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Download a completed audio URL into `{appData}/cache/audio/`.
+/// Find an existing cached audio file for a quality-specific stem.
+#[tauri::command]
+fn lookup_cached_audio(app: AppHandle, file_stem: String) -> Result<Option<String>, String> {
+    let paths = ensure_dirs(&app)?;
+    let stem = sanitize_stem(&file_stem);
+    let audio_dir = PathBuf::from(&paths.audio_dir);
+    Ok(find_cached_file(&audio_dir, &stem).map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// Download a completed audio URL into `{appData}/cache/audio/` using Range when possible.
 /// Does not forge browser headers or forward cookies.
 #[tauri::command]
 async fn download_audio(
@@ -177,18 +238,11 @@ async fn download_audio(
     let format_hint = format_hint.as_deref();
     let audio_dir = PathBuf::from(&paths.audio_dir);
 
-    for ext in ["mp3", "m4a", "flac", "ogg", "wav", "webm", "bin"] {
-        let candidate = audio_dir.join(format!("{stem}.{ext}"));
-        if candidate.is_file() {
-            if let Ok(meta) = fs::metadata(&candidate) {
-                if meta.len() > 0 {
-                    return Ok(DownloadAudioResult {
-                        path: candidate.to_string_lossy().into_owned(),
-                        reused: true,
-                    });
-                }
-            }
-        }
+    if let Some(existing) = find_cached_file(&audio_dir, &stem) {
+        return Ok(DownloadAudioResult {
+            path: existing.to_string_lossy().into_owned(),
+            reused: true,
+        });
     }
 
     let client = reqwest::Client::builder()
@@ -196,47 +250,83 @@ async fn download_audio(
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
-    let response = client
+    // Probe headers first (may also return body for small responses; we only need headers).
+    let head = client
         .get(&url)
         .header(reqwest::header::ACCEPT, "*/*")
+        .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
         .await
-        .map_err(|e| format!("download request: {e}"))?;
+        .map_err(|e| format!("download probe: {e}"))?;
 
-    if !response.status().is_success() {
-        return Err(format!("download HTTP {}", response.status()));
+    let status = head.status();
+    if !(status.is_success() || status.as_u16() == 206) {
+        return Err(format!("download HTTP {status}"));
     }
 
-    let headers = response.headers().clone();
+    let headers = head.headers().clone();
     let content_type = headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
     let disposition = headers
         .get(reqwest::header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok());
+    let accepts_ranges = headers
+        .get(reqwest::header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("bytes"))
+        .unwrap_or(status.as_u16() == 206);
 
     let ext = ext_from_disposition(disposition)
         .unwrap_or_else(|| ext_from_content_type(content_type, format_hint));
-
     let dest = audio_dir.join(format!("{stem}.{ext}"));
+    let tmp = audio_dir.join(format!("{stem}.{ext}.part"));
 
-    let bytes = response
-        .bytes()
+    // Drop probe body.
+    drop(head);
+
+    let mut append_from = 0_u64;
+    if accepts_ranges && tmp.is_file() {
+        if let Ok(meta) = fs::metadata(&tmp) {
+            append_from = meta.len();
+        }
+    } else if tmp.is_file() {
+        let _ = fs::remove_file(&tmp);
+    }
+
+    let mut request = client.get(&url).header(reqwest::header::ACCEPT, "*/*");
+    if append_from > 0 {
+        request = request.header(
+            reqwest::header::RANGE,
+            format!("bytes={append_from}-"),
+        );
+    }
+
+    let response = request
+        .send()
         .await
-        .map_err(|e| format!("download body: {e}"))?;
+        .map_err(|e| format!("download request: {e}"))?;
 
-    if bytes.is_empty() {
-        return Err("download returned empty body".into());
+    let status = response.status();
+    if append_from > 0 && status.as_u16() == 200 {
+        // Server ignored Range — restart full download.
+        append_from = 0;
+        let _ = fs::remove_file(&tmp);
+        let full = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "*/*")
+            .send()
+            .await
+            .map_err(|e| format!("download restart: {e}"))?;
+        if !full.status().is_success() {
+            return Err(format!("download HTTP {}", full.status()));
+        }
+        write_response_to_file(full, &dest, &tmp, 0).await?;
+    } else if status.is_success() || status.as_u16() == 206 {
+        write_response_to_file(response, &dest, &tmp, append_from).await?;
+    } else {
+        return Err(format!("download HTTP {status}"));
     }
-
-    let tmp = dest.with_extension(format!("{ext}.part"));
-    {
-        let mut file = fs::File::create(&tmp).map_err(|e| format!("create temp: {e}"))?;
-        file.write_all(&bytes)
-            .map_err(|e| format!("write temp: {e}"))?;
-        file.sync_all().map_err(|e| format!("sync temp: {e}"))?;
-    }
-    fs::rename(&tmp, &dest).map_err(|e| format!("finalize file: {e}"))?;
 
     Ok(DownloadAudioResult {
         path: dest.to_string_lossy().into_owned(),
@@ -252,6 +342,7 @@ pub fn run() {
             get_app_data_dir,
             ensure_cache_dirs,
             open_cache_dir,
+            lookup_cached_audio,
             download_audio
         ])
         .run(tauri::generate_context!())

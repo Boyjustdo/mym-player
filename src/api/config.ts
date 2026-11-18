@@ -1,5 +1,8 @@
+import { DEFAULT_QUALITY, type AudioQuality } from "./types";
+
 const STORAGE_KEY = "mym-player.apiBaseUrl";
 const PLATFORM_KEY = "mym-player.platform";
+const QUALITY_KEY = "mym-player.quality";
 
 /** Default API base (anonymous, no API key). */
 export const DEFAULT_API_BASE_URL = "https://music.op.wiki";
@@ -9,6 +12,13 @@ export const DEFAULT_API_BASE_URL = "https://music.op.wiki";
  * Clients should follow absolute URLs returned by the API as-is.
  */
 export const MEDIA_HOST_HINT = "music.zr.wiki";
+
+const QUALITY_SET = new Set<string>([
+  "standard",
+  "high",
+  "lossless",
+  "hires",
+]);
 
 export function getApiBaseUrl(): string {
   const saved = localStorage.getItem(STORAGE_KEY);
@@ -29,4 +39,18 @@ export function getSavedPlatform(fallback: string): string {
 
 export function setSavedPlatform(platform: string): void {
   localStorage.setItem(PLATFORM_KEY, platform);
+}
+
+export function getSavedQuality(
+  fallback: AudioQuality = DEFAULT_QUALITY,
+): AudioQuality {
+  const saved = localStorage.getItem(QUALITY_KEY)?.trim();
+  if (saved && QUALITY_SET.has(saved)) {
+    return saved as AudioQuality;
+  }
+  return fallback;
+}
+
+export function setSavedQuality(quality: AudioQuality): void {
+  localStorage.setItem(QUALITY_KEY, quality);
 }

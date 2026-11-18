@@ -24,6 +24,18 @@ export const PLATFORMS: { id: Platform; label: string }[] = [
 /** Default search/create platform (OpenAPI examples use tencent). */
 export const DEFAULT_PLATFORM: Platform = "tencent";
 
+/** OpenAPI suggested quality values (not a strict enum server-side). */
+export type AudioQuality = "standard" | "high" | "lossless" | "hires";
+
+export const AUDIO_QUALITIES: { id: AudioQuality; label: string }[] = [
+  { id: "standard", label: "标准" },
+  { id: "high", label: "较高" },
+  { id: "lossless", label: "无损" },
+  { id: "hires", label: "Hi-Res" },
+];
+
+export const DEFAULT_QUALITY: AudioQuality = "high";
+
 export type PlaybackStatus =
   | "queued"
   | "processing"

@@ -11,28 +11,45 @@ function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-function sanitizeStem(stem: string): string {
+export function sanitizeStem(stem: string): string {
   return stem.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "track";
 }
 
+/** Look up an existing quality-specific cache file without downloading. */
+export async function lookupCachedAudio(
+  fileStem: string,
+): Promise<DownloadResult | null> {
+  const stem = sanitizeStem(fileStem);
+  if (!isTauriRuntime()) return null;
+  try {
+    const path = await invoke<string | null>("lookup_cached_audio", {
+      fileStem: stem,
+    });
+    if (!path) return null;
+    return { path, playUrl: convertFileSrc(path), reused: true };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Download completed audio into the local cache directory and return a playable URL.
- * In Tauri: Rust writes the file; play via asset protocol (convertFileSrc).
- * In browser-only vite: blob object URL fallback (not persisted).
+ * Cache completed audio in the background (does not block playback).
+ * Cache keys must include quality (via playback id / fileStem).
  */
-export async function downloadAudioForPlayback(args: {
+export async function cacheAudioInBackground(args: {
   audioUrl: string;
   fileStem: string;
   formatHint?: string | null;
 }): Promise<DownloadResult> {
   const url = resolveApiUrl(args.audioUrl);
+  const stem = sanitizeStem(args.fileStem);
 
   if (isTauriRuntime()) {
     const result = await invoke<{ path: string; reused: boolean }>(
       "download_audio",
       {
         url,
-        fileStem: sanitizeStem(args.fileStem),
+        fileStem: stem,
         formatHint: args.formatHint ?? null,
       },
     );
@@ -43,14 +60,6 @@ export async function downloadAudioForPlayback(args: {
     };
   }
 
-  const res = await fetch(url, { headers: { Accept: "*/*" } });
-  if (!res.ok) {
-    throw new Error(`下载失败 HTTP ${res.status}`);
-  }
-  const blob = await res.blob();
-  return {
-    path: "(memory)",
-    playUrl: URL.createObjectURL(blob),
-    reused: false,
-  };
+  // Browser-only: no durable cache; caller already plays the remote URL.
+  return { path: "(memory)", playUrl: url, reused: false };
 }

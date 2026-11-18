@@ -82,6 +82,25 @@ body {
   gap: 8px;
 }
 
+.quality-select {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.quality-select select {
+  max-width: 16rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  padding: 0.55em 0.7em;
+  font-size: 1em;
+  font-family: inherit;
+  color: var(--text);
+  background: #151a22;
+}
+
 .api-base {
   display: flex;
   flex-direction: column;
